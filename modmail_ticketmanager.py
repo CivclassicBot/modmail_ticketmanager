@@ -71,6 +71,11 @@ requestTrackerQueueToPostTo = 1 # Tools -> Configuration -> Queues -> Select, wh
 # Request Tracker - User to use to post.
 requestTrackerUsername = '' 
 requestTrackerPassword = '' 
+						   
+# Section on auto-transition of tickets
+requestTrackerShouldWeTransitionTicketsOnReply = True
+requestTrackerTicketStatesThatWeShouldTransition = ['resolved','others_go_here'] # Lower case here please!  I am not doing case comparisons.
+requestTrackerTicketStateWeShouldTransitionTo = 'open'
 
 # Request Tracker -> Modmail replies Section.
 # This deals with what you have to do to allow request tracker to push modmail replies back into Reddit.
@@ -88,6 +93,7 @@ requestTrackerRedditModmailReply = 'Reply from the ModMail group:\n\n{Content}' 
 
 
 # End Definitions - Do not modify files below this line.
+
 
 # Request Tracker Specific 
 # https://github.com/z4r/python-rtkit#comment-on-a-ticket-with-attachments
@@ -226,10 +232,16 @@ def shouldAnyMoreMessagesBeProcessed(wasMessageAlreadyFullyInSystem, newestMessa
 	continueProcessing = True
 	if newestMessageEpochTimeUtc < redditAbsoluteOldestModmailRootNodeDateToConsider:
 		continueProcessing = False
+		if debug:
+			print "shouldAnyMoreMessagesBeProcessed:  Negative!  Message is older than the oldest message root node to consider."
 	elif wasMessageAlreadyFullyInSystem and not inExtendedValidationMode:
 		continueProcessing = False
+		if debug:
+			print "shouldAnyMoreMessagesBeProcessed:  Negative!  Message is already fully in our system and not in extended validation mode."
 	elif wasMessageAlreadyFullyInSystem and inExtendedValidationMode and newestMessageEpochTimeUtc < extendedValidationModeOldDatePeriod:
 		continueProcessing = False
+		if debug:
+			print "shouldAnyMoreMessagesBeProcessed:  Negative!  Message is already fully in our system and even though in inExtendedValidationMode the newest reply is older than our extended validation age (redditMaximumAmountOfDaysToAllowLookbackForMissingReplies)."
 	
 	return continueProcessing
 	
@@ -239,13 +251,14 @@ def shouldAnyMoreMessagesBeProcessed(wasMessageAlreadyFullyInSystem, newestMessa
 # When called, will update our understanding of our extended period end date.
 def setGlobalVariablesForExtendedValidationMode():
 	global extendedValidationModeOldDatePeriod
-	period = (datetime.now() - timedelta(days=8) - datetime(1970,1,1))
+	period = (datetime.now() - timedelta(days=redditMaximumAmountOfDaysToAllowLookbackForMissingReplies) - datetime(1970,1,1))
 	extendedValidationModeOldDatePeriod = period.days * 86400 + period.seconds
 	
 	
 def processModMailRootMessage(debug, mail, inExtendedValidationMode):
 	shouldContinueProcessingMail = True
 	alreadyProcessedAllItems = True
+	weCreatedModmailRootMessage = False
 	
 	#Helping debug output.
 	firstTime = True
@@ -280,6 +293,7 @@ def processModMailRootMessage(debug, mail, inExtendedValidationMode):
 	#If we dont find it, we need to add it in.
 	if ticketId == None:
 		alreadyProcessedAllItems = False #	There is at least one thing that we didnt find.
+		weCreatedModmailRootMessage = True
 		
 		if debug:
 			print('Core message not found in system.  Processing.')
@@ -303,12 +317,154 @@ def processModMailRootMessage(debug, mail, inExtendedValidationMode):
 	
 	# At this point, variable ticketId is the appropriate integer ticket number where the parent is already at.
 	# Now that we have handled the parent, check for each of the children within this root parent.
-	allRepliesHandled = handleMessageReplies(debug, ticketId, rootMessageId, rootReplies, messageNewestAge)
+	messageReplyReturn = handleMessageReplies(debug, ticketId, rootMessageId, rootReplies, messageNewestAge)
+	allRepliesHandled = messageReplyReturn['foundAllItems']
+	messageNewestAge = messageReplyReturn['messageNewestAge']
+		
 	alreadyProcessedAllItems = alreadyProcessedAllItems and allRepliesHandled
+	
+	# If we have any replies and we didnt just create this modmail root message,
+	# then we need to assume the ticket could be closed.  Do we need to open it?
+	if not weCreatedModmailRootMessage and messageReplyReturn['foundReplyBySomeoneOtherThanTicketManager'] and requestTrackerShouldWeTransitionTicketsOnReply:
+		transitionTicketToExpectedState(ticketId)
 	
 	shouldContinueProcessingMail = shouldAnyMoreMessagesBeProcessed(alreadyProcessedAllItems, messageNewestAge, inExtendedValidationMode)
 	
 	return shouldContinueProcessingMail
+
+def getTicketData(ticketId):
+	try:
+		getTicketStatusUrl = 'ticket/' + str(ticketId)
+		response = resource.get(path=getTicketStatusUrl)
+		
+		responseObj = []
+		for ticket in response.parsed:
+			responseObj.append({})
+			for attribute in ticket:
+				responseObj[len(responseObj)-1][attribute[0]] = attribute[1]
+		
+		return responseObj
+	
+	except RTResourceError as e:
+		errorMsg = 'Failed to get ticket information for ticket id ' + str(ticketId) + '.'
+		print(errorMsg)
+		return []
+	except:
+		# Do not vulgarly error out.
+		e = str(sys.exc_info()[0])
+		l = str(sys.exc_traceback.tb_lineno)
+		error = str(datetime.utcnow()) + ' - Error when attempting to getTicketData on line number ' + l + '.  Exception:  ' + e
+		print(error)
+		
+		# Go overboard on logging if we are in debug mode.  
+		if debug:
+			exc_type, exc_value, exc_traceback = sys.exc_info()
+			print "*** print_tb:"
+			traceback.print_tb(exc_traceback, limit=1, file=sys.stdout)
+			print "*** print_exception:"
+			traceback.print_exception(exc_type, exc_value, exc_traceback,
+									  limit=2, file=sys.stdout)
+			print "*** print_exc:"
+			traceback.print_exc()
+			print "*** format_exc, first and last line:"
+			formatted_lines = traceback.format_exc().splitlines()
+			print formatted_lines[0]
+			print formatted_lines[-1]
+			print "*** format_exception:"
+			print repr(traceback.format_exception(exc_type, exc_value,
+												  exc_traceback))
+			print "*** extract_tb:"
+			print repr(traceback.extract_tb(exc_traceback))
+			print "*** format_tb:"
+			print repr(traceback.format_tb(exc_traceback))
+			print "*** tb_lineno:", exc_traceback.tb_lineno
+		return []
+
+def setTicketStateTo(ticketId, newState):
+	try:
+		content = {
+			'content': {
+				'Status': newState,
+			}
+		}
+		responseUrl = 'ticket/' + str(ticketId) + '/edit'
+		response = resource.post(path=responseUrl, payload=content,)
+	except:
+		# Do not vulgarly error out.
+		e = str(sys.exc_info()[0])
+		l = str(sys.exc_traceback.tb_lineno)
+		error = str(datetime.utcnow()) + ' - Error when attempting to setTicketStateTo (transitioning the ticket) on line number ' + l + '.  Exception:  ' + e
+		print(error)
+		
+		# Go overboard on logging if we are in debug mode.  
+		if debug:
+			exc_type, exc_value, exc_traceback = sys.exc_info()
+			print "*** print_tb:"
+			traceback.print_tb(exc_traceback, limit=1, file=sys.stdout)
+			print "*** print_exception:"
+			traceback.print_exception(exc_type, exc_value, exc_traceback,
+									  limit=2, file=sys.stdout)
+			print "*** print_exc:"
+			traceback.print_exc()
+			print "*** format_exc, first and last line:"
+			formatted_lines = traceback.format_exc().splitlines()
+			print formatted_lines[0]
+			print formatted_lines[-1]
+			print "*** format_exception:"
+			print repr(traceback.format_exception(exc_type, exc_value,
+												  exc_traceback))
+			print "*** extract_tb:"
+			print repr(traceback.extract_tb(exc_traceback))
+			print "*** format_tb:"
+			print repr(traceback.format_tb(exc_traceback))
+			print "*** tb_lineno:", exc_traceback.tb_lineno
+		
+		pass
+	
+def transitionTicketToExpectedState(ticketId):
+	try:
+		ticketData = getTicketData(ticketId)
+		if len(ticketData) > 0:
+			currentTicketStatus = ticketData[0]['Status']
+			
+			#Is this status one that we are transitioning?
+			if currentTicketStatus.lower() in requestTrackerTicketStatesThatWeShouldTransition:
+				#Transition it!
+				setTicketStateTo(ticketId, requestTrackerTicketStateWeShouldTransitionTo)
+		
+	except:
+		# Do not vulgarly error out.
+		e = str(sys.exc_info()[0])
+		l = str(sys.exc_traceback.tb_lineno)
+		error = str(datetime.utcnow()) + ' - Error when attempting to transitionTicketToExpectedState on line number ' + l + '.  Exception:  ' + e
+		print(error)
+		
+		# Go overboard on logging if we are in debug mode.  
+		if debug:
+			exc_type, exc_value, exc_traceback = sys.exc_info()
+			print "*** print_tb:"
+			traceback.print_tb(exc_traceback, limit=1, file=sys.stdout)
+			print "*** print_exception:"
+			traceback.print_exception(exc_type, exc_value, exc_traceback,
+									  limit=2, file=sys.stdout)
+			print "*** print_exc:"
+			traceback.print_exc()
+			print "*** format_exc, first and last line:"
+			formatted_lines = traceback.format_exc().splitlines()
+			print formatted_lines[0]
+			print formatted_lines[-1]
+			print "*** format_exception:"
+			print repr(traceback.format_exception(exc_type, exc_value,
+												  exc_traceback))
+			print "*** extract_tb:"
+			print repr(traceback.extract_tb(exc_traceback))
+			print "*** format_tb:"
+			print repr(traceback.format_tb(exc_traceback))
+			print "*** tb_lineno:", exc_traceback.tb_lineno
+		
+		pass
+	
+		
 	
 def noteTheFactWeProcessedAMessageId(messageId, parentMessageId, ticketId):
 	openSqlConnections()
@@ -360,12 +516,10 @@ def getTicketIdForAlreadyProcessedRootMessage(rootMessageId):
 	return ticketId
 
 # In reply object
-# out - True/False - True iff all children found were ones we already processed
-# NOTE:  messageNewestAge is being passed by reference and we are updating the value
-# 	outside of this function.
+# out - Object with two properties that denote if we already processed all items and the newest message age.
 def handleMessageReplies(debug, ticketId, rootMessageId, replies, messageNewestAge):
 	firstTimeWithReply = True
-	foundAllItems = True
+	messageReplyReturn = {'foundAllItems':True, 'messageNewestAge':messageNewestAge, 'foundReplyBySomeoneOtherThanTicketManager':False}
 	
 	for reply in replies:
 					
@@ -378,12 +532,11 @@ def handleMessageReplies(debug, ticketId, rootMessageId, replies, messageNewestA
 		replyMessageId = str(reply.id) # Base 36, contains alphanumeric
 		replyAge       = int(round(float(str(reply.created_utc))))
 		
-		# messageNewestAge is passed by reference, we are updating data in the core routine.
-		if replyAge > messageNewestAge:
+		if replyAge > messageReplyReturn['messageNewestAge']:
 			if debug:
-				debugText = 'Found a message component with a newer age.  Old lowest-age = ' + str(messageNewestAge) + ', New lowest-age = ' + str(replyAge)
+				debugText = 'Found a message component with a newer age.  Old lowest-age = ' + str(messageReplyReturn['messageNewestAge']) + ', New lowest-age = ' + str(replyAge)
 				print(debugText)
-			messageNewestAge = replyAge
+			messageReplyReturn['messageNewestAge'] = replyAge
 		
 		if debug:
 			debugText = 'Checking if message reply is handled yet.  Body:  ' + replyBody
@@ -393,7 +546,10 @@ def handleMessageReplies(debug, ticketId, rootMessageId, replies, messageNewestA
 		alreadyProcessed = getHasReplyBeenProcessed(rootMessageId, replyMessageId)
 		
 		if not alreadyProcessed:
-			foundAllItems = False #	There is at least one thing that we didnt find.
+			messageReplyReturn['foundAllItems'] = False #	There is at least one thing that we didnt find.
+			
+			if replyAuthor.lower() != redditUsername.lower():
+				messageReplyReturn['foundReplyBySomeoneOtherThanTicketManager'] = True
 			
 			if debug:
 				print('Reply message not found in system.  Processing.')
@@ -409,7 +565,7 @@ def handleMessageReplies(debug, ticketId, rootMessageId, replies, messageNewestA
 			if debug:
 				print('Reply message already found in system.')
 	
-	return foundAllItems
+	return messageReplyReturn
 	
 # no error handling, let errors bubble up.
 # in - message information
