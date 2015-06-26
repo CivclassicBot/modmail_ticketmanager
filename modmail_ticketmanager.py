@@ -11,6 +11,7 @@
 #	Sqlite - You will need to install this yourself.  (apt-get)
 #   argparse - You will need to install this yourself.  (pip install)
 # 	RequestTracker python helper rtkit (pip install)
+#   mysql-connector- pip install mysql-connector-python
 #
 # To use, change the relevant items in the #Definitions section.  You should not change
 #	anything below that line.  When ran, this will put itself into a loop with waits in 
@@ -102,6 +103,17 @@ requestTrackerInitialTicketCreationSubject = 'Modmail - {Author} - {Subject}'
 requestTrackerInitialTicketCreationComment = 'Post from {Author}\nResponse URL: {ModmailMessageUrl}\nContents:\n{Content}'
 requestTrackerThreadReply = 'Post from {Author}\nContents:\n{Content}'
 
+reddit_account_info_Field = 'MC Accounts' # The field for where it should populate mc accounts to the reddit account.
+
+# Set to true to allow users who have their accounts authenticated to auto populate.
+autoPopulateFields = False
+
+# Mysql information, be sure to point this to the location of the tables of the bukkit plugin, leave if you wont use this feature.
+mysql_username = ''
+mysql_password = ''
+mysql_host = 'localhost'
+mysql_dbname = ''
+
 # End Definitions - Do not modify files below this line.
 
 
@@ -125,6 +137,7 @@ import sys, traceback
 from datetime import datetime
 from datetime import timedelta  
 import unicodedata # normalize unicode strings.
+import mysql.connector
 
 prawUserAgent = 'ModMailTicketCreator v0.01 by /u/Pentom'
 
@@ -132,6 +145,9 @@ prawUserAgent = 'ModMailTicketCreator v0.01 by /u/Pentom'
 arg_parser = argparse.ArgumentParser(description='Modmail / RequestTracker ticket daemon')
 arg_parser.add_argument('-l', '--logfile', help='The log file to store output in addition to stdout')
 
+cnx = None
+
+get_mc_users_from_redditaccount = 'select name from redditrelations where reddit_name %(reddit_name)s'
 
 def logException():
   exc_type, exc_value, exc_traceback = sys.exc_info()
@@ -317,6 +333,8 @@ def processModMailRootMessage(debug, mail, inExtendedValidationMode):
 			
 		ticketId = createTicket(rootAuthor, rootSubject, rootBody, rootResponseUrl)
 		
+		handle_pushing_player_accounts(ticketId, rootAuthor)
+		
 		log.debug('Added ticket to ticket system - ticket id:  {0}'.format(ticketId))
 		
 		if ticketId < 1:
@@ -344,6 +362,46 @@ def processModMailRootMessage(debug, mail, inExtendedValidationMode):
 	shouldContinueProcessingMail = shouldAnyMoreMessagesBeProcessed(alreadyProcessedAllItems, messageNewestAge, inExtendedValidationMode)
 	
 	return shouldContinueProcessingMail
+
+def handle_pushing_player_accounts(ticketId, author):
+	if not autoPopulateFields:
+		return
+	accounts = ''
+	for account in getRequiredAccountInfo(author):
+		accounts += account + ' '
+	content = {
+		'content': {
+			'CF.{' + handle_pushing_player_accounts + '}': accounts
+		}
+	}
+	try:
+		response = resource.post(path='ticket/' + str(ticketId) + '/edit', payload=content,)
+		if response.status_int != 200:
+			raise LookupError('Was unable to update expected ticket, we should defensively exit here.')
+		
+	except:
+		# Display error and Fail.
+		# Lets not play around with errors where we cant remove from the ticket.
+		# In this case, we could cause a never ending stream of reddit replies and noone wants that.
+		e = str(sys.exc_info()[0])
+		l = str(sys.exc_traceback.tb_lineno)
+		log.error('Error when attempting to update the ticket on line number {0}.  Exception:  {1}'.format(l, e))
+		logException()
+		closeSqlConnections() # in case we have open connections, commit changes and exit.  Changes safe to commit due to order of operations.
+		sys.exit(1)
+	
+
+def getRequiredAccountInfo(author):
+	names = []
+	try:
+		cursor = cnx.cursor()
+		cursor.execute(get_mc_users_from_redditaccount)
+		for name in cursor.fetchmany():
+			names.append(name)
+	finally:
+		cnx.commit()
+		cursor.close()
+	return names
 
 def getTicketData(ticketId):
 	try:
@@ -692,7 +750,16 @@ def getRedditPostUrlFromTicketId(ticketId):
 	closeSqlConnections()
 	
 	return returnValue
-	
+
+def check_mysql_connection():
+	try:
+		cnx = mysql.connector.connect(user=mysql_username, password=mysql_password,
+                              host=mysql_host,
+                              database=mysql_dbname)
+		return True
+	except mysql.connector.Error as err:
+		log('Mysql connection could not be established')
+		return False	
 
 def mainloop():
 	
@@ -712,6 +779,9 @@ def mainloop():
 if __name__ == '__main__':
 	args = arg_parser.parse_args()
 	log_level = logging.INFO
+	if not check_mysql_connection():
+		autoPopulateFields = False # So the script can continue without this.
+		log.debug('The Mysql failed to connect to the server.')
 	if debug:
 		log_level = logging.DEBUG
 	setupLogger(log_level=log_level, log_file=args.logfile)
